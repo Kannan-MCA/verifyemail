@@ -121,21 +121,18 @@ public class MXLookupService  {
             BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
 
-            // Read server greeting
             String response = reader.readLine();
             if (response == null || !response.startsWith("220")) {
                 return false;
             }
 
-            // Send EHLO
-            writer.write("EHLO example.com\r\n");
+            writer.write("HEHLO kaalb.in\r\n");
             writer.flush();
             while ((response = reader.readLine()) != null) {
                 if (response.startsWith("250 ")) break;
             }
 
-            // Send MAIL FROM
-            writer.write("MAIL FROM:<check@example.com>\r\n");
+            writer.write("MAIL FROM:<support@kaalb.in>\r\n");
             writer.flush();
             response = reader.readLine();
             if (response == null || !response.startsWith("250")) {
@@ -149,15 +146,15 @@ public class MXLookupService  {
             if (response == null) {
                 return null;
             } else if (response.startsWith("250")) {
-                return true; // Recipient accepted
+                return true;
             } else if (response.startsWith("550")) {
-                return false; // Recipient rejected
+                return false;
             } else {
-                return null; // Ambiguous response
+                return null;
             }
 
         } catch (Exception e) {
-            return null; // Connection or protocol error
+            return null;
         }
     }
 
