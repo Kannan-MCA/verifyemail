@@ -10,16 +10,14 @@ import com.k3n.verifyemail.services.MXLookupService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import javax.naming.NamingException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/mxlookup")
-public class MXLookupController
-{
+public class MXLookupController {
+
     private final MXLookupService mxLookupService;
     private final emailrepository emailRepository;
     private final emailverificationresultrepository resultRepository;
@@ -59,9 +57,11 @@ public class MXLookupController
         for (EmailEntity emailEntity : emails) {
             String email = emailEntity.getEmail();
             String category = mxLookupService.categorizeEmail(email);
+
             Map<String, Object> resultDetails = new HashMap<>();
             resultDetails.put("email", email);
             resultDetails.put("category", category);
+
             try {
                 String jsonResult = objectMapper.writeValueAsString(resultDetails);
                 EmailVerificationResultEntity resultEntity = new EmailVerificationResultEntity();
@@ -69,10 +69,9 @@ public class MXLookupController
                 resultEntity.setVerificationResultJson(jsonResult);
                 resultRepository.save(resultEntity);
             } catch (JsonProcessingException e) {
-                // Handle exception as needed
+                // Optional: log or handle serialization error
             }
         }
         return ResponseEntity.ok(Map.of("message", "Processed and stored email validation results."));
     }
-
 }
