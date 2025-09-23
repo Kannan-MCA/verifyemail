@@ -8,6 +8,10 @@ import javax.naming.directory.Attribute;
 import javax.naming.directory.Attributes;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.InitialDirContext;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.*;
@@ -113,10 +117,47 @@ public class MXLookupService  {
     private Boolean trySmtpRecipient(String mxHost, String email) {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(mxHost, 25), 3000);
-            // Real SMTP handshake implementation needed here to return true/false/null.
-            return null;
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
+
+            // Read server greeting
+            String response = reader.readLine();
+            if (response == null || !response.startsWith("220")) {
+                return false;
+            }
+
+            // Send EHLO
+            writer.write("EHLO example.com\r\n");
+            writer.flush();
+            while ((response = reader.readLine()) != null) {
+                if (response.startsWith("250 ")) break;
+            }
+
+            // Send MAIL FROM
+            writer.write("MAIL FROM:<check@example.com>\r\n");
+            writer.flush();
+            response = reader.readLine();
+            if (response == null || !response.startsWith("250")) {
+                return false;
+            }
+
+            // Send RCPT TO
+            writer.write("RCPT TO:<" + email + ">\r\n");
+            writer.flush();
+            response = reader.readLine();
+            if (response == null) {
+                return null;
+            } else if (response.startsWith("250")) {
+                return true; // Recipient accepted
+            } else if (response.startsWith("550")) {
+                return false; // Recipient rejected
+            } else {
+                return null; // Ambiguous response
+            }
+
         } catch (Exception e) {
-            return null;
+            return null; // Connection or protocol error
         }
     }
 
