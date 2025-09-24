@@ -1,14 +1,16 @@
 package com.k3n.verifyemail.services;
 
+import com.k3n.verifyemail.config.BlacklistDomainConfig;
 import com.k3n.verifyemail.config.DisposableDomainConfig;
+import com.k3n.verifyemail.config.WhitelistedDomains;
+import com.k3n.verifyemail.util.SmtpRcptValidator;
+import com.k3n.verifyemail.util.SmtpRcptValidator.SmtpRecipientStatus;
 import org.springframework.stereotype.Service;
 
 import javax.naming.Context;
 import javax.naming.NamingException;
 import javax.naming.directory.*;
-import java.io.*;
-import java.net.InetSocketAddress;
-import java.net.Socket;
+import java.io.IOException;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -20,17 +22,18 @@ public class MXLookupService {
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
             "^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$", Pattern.CASE_INSENSITIVE);
 
-    private static final int SMTP_PORT = 25;
-    private static final int SOCKET_TIMEOUT_MS = 3000;
-
     private final Set<String> disposableDomains;
-    private final String ehloDomain;
-    private final String mailFromAddress;
+    private final Set<String> blacklistDomains;
+    private final Set<String> whitelistedDomains;
 
-    public MXLookupService(DisposableDomainConfig config) {
-        this.disposableDomains = config.getDomainSet();
-        this.ehloDomain = "kaalb.in";         // configurable as needed
-        this.mailFromAddress = "support@kaalb.in";  // configurable as needed
+    private final SmtpRcptValidator smtpRcptValidator;
+
+    public MXLookupService(DisposableDomainConfig disposableConfig, BlacklistDomainConfig blacklistDomainConfig, WhitelistedDomains whitelistedDomains) {
+        this.disposableDomains = disposableConfig.getDomainSet();
+        this.blacklistDomains = blacklistDomainConfig.getDomainSet();
+        this.whitelistedDomains = whitelistedDomains.getDomainSet();
+
+        this.smtpRcptValidator = new SmtpRcptValidator();
     }
 
     public String categorizeEmail(String email) {
@@ -58,18 +61,19 @@ public class MXLookupService {
             return "Unknown";
         }
 
-        Integer smtpStatus = smtpCheckStatus(mxRecords, email);
+        SmtpRecipientStatus smtpStatus = smtpCheckStatus(mxRecords, email);
         if (smtpStatus == null) return "Unknown";
 
         switch (smtpStatus) {
-            case 1: // Valid user
+            case Valid:
                 return "Valid";
-            case 0: // User not found
+            case UserNotFound:
                 return "UserNotFound";
-            case -1: // Invalid or rejected typically
-                return "Invalid";
-            default:
+            case TemporaryFailure:
                 return "Unknown";
+            case UnknownFailure:
+            default:
+                return "Invalid";
         }
     }
 
@@ -94,8 +98,21 @@ public class MXLookupService {
         Attributes attrs = ctx.getAttributes(domain, new String[]{"MX"});
         Attribute attr = attrs.get("MX");
 
-        if (attr == null) {
-            return Collections.emptyList();
+        if (attr == null || attr.size() == 0) { // fallback to A records
+            Attributes aAttrs = ctx.getAttributes(domain, new String[]{"A"});
+            Attribute aAttr = aAttrs.get("A");
+            if (aAttr == null || aAttr.size() == 0) {
+                return Collections.emptyList();
+            }
+            return IntStream.range(0, aAttr.size())
+                    .mapToObj(i -> {
+                        try {
+                            return "0 " + aAttr.get(i).toString();
+                        } catch (NamingException e) {
+                            throw new RuntimeException(e);
+                        }
+                    })
+                    .collect(Collectors.toList());
         }
 
         List<String> mxRecords = IntStream.range(0, attr.size())
@@ -126,115 +143,13 @@ public class MXLookupService {
     public boolean isCatchAll(List<String> mxRecords, String domain) throws IOException {
         String mxHost = extractMxHost(mxRecords.get(0));
         String fakeEmail = generateRandomLocalPart() + "@" + domain;
-        Boolean catchAllResult = trySmtpRecipient(mxHost, fakeEmail);
-        return Boolean.TRUE.equals(catchAllResult);
-    }
-    private Boolean trySmtpRecipient(String mxHost, String email) {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(mxHost, SMTP_PORT), SOCKET_TIMEOUT_MS);
-            socket.setSoTimeout(SOCKET_TIMEOUT_MS);
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-
-            if (!readResponse(reader, "220")) return false;
-
-            sendCommand(writer, "EHLO " + ehloDomain);
-            if (!readResponse(reader, "250")) return false;
-
-            sendCommand(writer, "MAIL FROM:<" + mailFromAddress + ">");
-            if (!readResponse(reader, "250")) return false;
-
-            sendCommand(writer, "RCPT TO:<" + email + ">");
-            String response = reader.readLine();
-            if (response == null) return null;
-
-            response = response.toLowerCase(Locale.ROOT);
-
-            if (response.startsWith("250")) return true;                  // Recipient accepted (valid)
-            if (response.startsWith("550") || response.startsWith("553") ||
-                    response.contains("recipient address rejected")) return false; // User not found / rejected
-
-            if (response.startsWith("450") || response.startsWith("451") || response.startsWith("452")) {
-                return null;                                              // Temporary failure - unknown
-            }
-
-            return null;  // Other responses inconclusive
-
-        } catch (IOException e) {
-            return null;  // Could not connect or error - unknown status
-        }
+        SmtpRecipientStatus catchAllResult = smtpRcptValidator.validateRecipient(mxHost, fakeEmail);
+        return catchAllResult == SmtpRecipientStatus.Valid;
     }
 
-
-    /**
-     * Checks SMTP status returning:
-     * 1 for Valid
-     * 0 for User not found
-     * -1 for Invalid (other failures)
-     * null for unknown/inconclusive
-     */
-    private Integer smtpCheckStatus(List<String> mxRecords, String email) {
+    private SmtpRecipientStatus smtpCheckStatus(List<String> mxRecords, String email) {
         String mxHost = extractMxHost(mxRecords.get(0));
-        return trySmtpRecipientWithStatus(mxHost, email);
-    }
-
-    private Integer trySmtpRecipientWithStatus(String mxHost, String email) {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(mxHost, SMTP_PORT), SOCKET_TIMEOUT_MS);
-            socket.setSoTimeout(SOCKET_TIMEOUT_MS);
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-
-            if (!readResponse(reader, "220")) return -1;
-
-            sendCommand(writer, "EHLO " + ehloDomain);
-            if (!readResponse(reader, "250")) return -1;
-
-            sendCommand(writer, "MAIL FROM:<" + mailFromAddress + ">");
-            if (!readResponse(reader, "250")) return -1;
-
-            sendCommand(writer, "RCPT TO:<" + email + ">");
-            String response = reader.readLine();
-            if (response == null) return null;
-
-            response = response.toLowerCase(Locale.ROOT);
-
-            if (response.startsWith("250")) return 1;           // Valid recipient
-            if (response.startsWith("550")) return 0;           // User not found
-            if (response.startsWith("553") || response.contains("recipient address rejected")) return 0;
-
-            if (response.startsWith("450") || response.startsWith("451") ||
-                    response.startsWith("452") || response.startsWith("4")) return null; // Temporary failure
-
-            // For all other responses treat as invalid or unknown
-            return -1;
-
-        } catch (IOException e) {
-            return null; // Unknown due to network/error issues
-        }
-    }
-
-    private void sendCommand(BufferedWriter writer, String command) throws IOException {
-        writer.write(command);
-        writer.write("\r\n");
-        writer.flush();
-    }
-
-    private boolean readResponse(BufferedReader reader, String expectedPrefix) throws IOException {
-        String line;
-        while ((line = reader.readLine()) != null) {
-            if (line.startsWith(expectedPrefix)) {
-                // Check if multiline SMTP response (hyphen after code)
-                if (line.length() > 3 && line.charAt(3) == '-') continue;
-                return true;
-            }
-            if (line.startsWith("4") || line.startsWith("5")) {
-                return false;
-            }
-        }
-        return false;
+        return smtpRcptValidator.validateRecipient(mxHost, email);
     }
 
     private String extractMxHost(String mxRecord) {
