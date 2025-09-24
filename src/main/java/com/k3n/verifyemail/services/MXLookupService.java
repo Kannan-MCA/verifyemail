@@ -27,7 +27,6 @@ public class MXLookupService {
     private final Set<String> disposableDomains;
     private final Set<String> blacklistDomains;
     private final Set<String> whitelistedDomains;
-
     private final SmtpRcptValidator smtpRcptValidator;
 
     @Autowired
@@ -64,19 +63,44 @@ public class MXLookupService {
             return "Unknown";
         }
 
-        SmtpRecipientStatus smtpStatus = smtpCheckStatus(mxRecords, email);
-        if (smtpStatus == null) return "Unknown";
+        ValidationResult result = smtpCheckStatus(mxRecords, email);
+        if (result == null) return "Unknown";
 
-        switch (smtpStatus) {
-            case Valid:
+        // Optional: log diagnostics
+        System.out.println("SMTP Status: " + result.getStatus());
+        System.out.println("SMTP Code: " + result.getSmtpCode());
+        System.out.println("Diagnostic Tag: " + result.getDiagnosticTag());
+        System.out.println("Transcript:\n" + result.getFullTranscript());
+
+        switch (result.getDiagnosticTag()) {
+            case "Accepted":
                 return "Valid";
-            case UserNotFound:
+            case "Forwarded":
+                return "Forwarded";
+            case "CannotVerify":
+                return "CannotVerify";
+            case "MailboxBusy":
+                return "MailboxBusy";
+            case "LocalError":
+                return "LocalError";
+            case "InsufficientStorage":
+                return "InsufficientStorage";
+            case "MailboxNotFound":
+            case "UserNotLocal":
+            case "MailboxNameInvalid":
                 return "UserNotFound";
-            case TemporaryFailure:
-                return "Unknown";
-            case UnknownFailure:
-            default:
+            case "RelayDenied":
+                return "RelayDenied";
+            case "AccessDenied":
+                return "AccessDenied";
+            case "Greylisted":
+                return "Greylisted";
+            case "SyntaxError":
+                return "SyntaxError";
+            case "TransactionFailed":
                 return "Invalid";
+            default:
+                return result.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid";
         }
     }
 
@@ -95,88 +119,42 @@ public class MXLookupService {
         return disposableDomains.contains(domain);
     }
 
-    /**
-     * Retrieves MX records for the given domain.
-     * @param domain The domain to look up
-     * @return List of MX records as strings (format: "priority host")
-     * @throws NamingException if there's an error during DNS lookup
-     * @throws IllegalArgumentException if domain is null or empty
-     */
     public List<String> getMXRecords(String domain) throws NamingException {
-        if (domain == null || domain.trim().isEmpty()) {
-            throw new IllegalArgumentException("Domain cannot be null or empty");
-        }
-
-        // Remove any trailing dot if present
-        domain = domain.endsWith(".") ? domain.substring(0, domain.length() - 1) : domain;
-        
         Hashtable<String, String> env = new Hashtable<>();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.dns.DnsContextFactory");
-        env.put(Context.PROVIDER_URL, "dns:");
-        env.put("com.sun.jndi.ldap.read.timeout", "5000"); // 5 second timeout
-        
-        DirContext ctx = null;
-        try {
-            ctx = new InitialDirContext(env);
-            
-            // Try to get MX records first
-            Attributes attrs = ctx.getAttributes(domain, new String[]{"MX"});
-            Attribute attr = attrs.get("MX");
+        DirContext ctx = new InitialDirContext(env);
+        Attributes attrs = ctx.getAttributes(domain, new String[]{"MX"});
+        Attribute attr = attrs.get("MX");
 
-            if (attr == null || attr.size() == 0) { // fallback to A records
-                return getARecords(ctx, domain);
-            }
-
-            return processMxRecords(attr);
-        } finally {
-            if (ctx != null) {
-                try {
-                    ctx.close();
-                } catch (NamingException e) {
-                    // Log the error but don't propagate as it's in finally
-                    System.err.println("Warning: Error closing DirContext: " + e.getMessage());
-                }
-            }
-        }
-    }
-    
-    private List<String> getARecords(DirContext ctx, String domain) throws NamingException {
-        try {
+        if (attr == null || attr.size() == 0) {
             Attributes aAttrs = ctx.getAttributes(domain, new String[]{"A"});
             Attribute aAttr = aAttrs.get("A");
-            if (aAttr == null || aAttr.size() == 0) {
-                return Collections.emptyList();
-            }
+            if (aAttr == null || aAttr.size() == 0) return Collections.emptyList();
+
             return IntStream.range(0, aAttr.size())
                     .mapToObj(i -> {
                         try {
                             return "0 " + aAttr.get(i).toString();
                         } catch (NamingException e) {
-                            throw new RuntimeException("Failed to process A record: " + e.getMessage(), e);
+                            throw new RuntimeException(e);
                         }
                     })
                     .collect(Collectors.toList());
-        } catch (NamingException e) {
-            throw new NamingException("Failed to get A records for domain " + domain + ": " + e.getMessage());
         }
-    }
-    
-    private List<String> processMxRecords(Attribute attr) throws NamingException {
-        List<String> mxRecords = new ArrayList<>();
-        for (int i = 0; i < attr.size(); i++) {
-            try {
-                String record = attr.get(i).toString();
-                if (record != null && !record.trim().isEmpty()) {
-                    mxRecords.add(record);
-                }
-            } catch (NamingException e) {
-                // Log the error but continue with other records
-                System.err.println("Warning: Failed to process MX record: " + e.getMessage());
-            }
-        }
-        return mxRecords.stream()
+
+        List<String> mxRecords = IntStream.range(0, attr.size())
+                .mapToObj(i -> {
+                    try {
+                        return attr.get(i).toString();
+                    } catch (NamingException e) {
+                        return "";
+                    }
+                })
+                .filter(s -> !s.isEmpty())
                 .sorted(Comparator.comparingInt(this::parsePriority))
                 .collect(Collectors.toList());
+
+        return mxRecords;
     }
 
     private int parsePriority(String mxRecord) {
@@ -197,12 +175,11 @@ public class MXLookupService {
         return result != null && result.getStatus() == SmtpRecipientStatus.Valid;
     }
 
-    private SmtpRecipientStatus smtpCheckStatus(List<String> mxRecords, String email) {
+    private ValidationResult smtpCheckStatus(List<String> mxRecords, String email) {
         if (mxRecords == null || mxRecords.isEmpty()) return null;
 
         String mxHost = extractMxHost(mxRecords.get(0));
-        ValidationResult result = smtpRcptValidator.validateRecipient(mxHost, email);
-        return result != null ? result.getStatus() : null;
+        return smtpRcptValidator.validateRecipient(mxHost, email);
     }
 
     private String extractMxHost(String mxRecord) {
