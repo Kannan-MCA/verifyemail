@@ -1,54 +1,103 @@
 package com.k3n.verifyemail.util;
 
-import com.sun.mail.smtp.SMTPTransport;
-import jakarta.mail.Session;
+import org.springframework.stereotype.Component;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 
-import java.util.Properties;
-
+/**
+ * Utility for validating SMTP recipients by issuing SMTP commands over raw sockets.
+ * Performs EHLO, MAIL FROM and RCPT TO commands to verify recipient existence.
+ */
+@Component
 public class SmtpRcptValidator {
 
     public enum SmtpRecipientStatus {
-        Valid, UserNotFound, TemporaryFailure, UnknownFailure
+        Valid,
+        UserNotFound,
+        TemporaryFailure,
+        UnknownFailure
     }
 
-    public SmtpRecipientStatus validateRecipient(String mxHost, String email) {
-        Properties props = new Properties();
-        props.put("mail.smtp.host", mxHost);
-        props.put("mail.smtp.port", "25");
-        props.put("mail.smtp.connectiontimeout", "5000");
-        props.put("mail.smtp.timeout", "5000");
+    public static class ValidationResult {
+        private final SmtpRecipientStatus status;
+        private final int smtpCode;
+        private final String smtpResponse;
+        private final String errorMessage;
 
-        Session session = Session.getInstance(props, null);
-        session.setDebug(false); // Set true for verbose SMTP logs
+        public ValidationResult(SmtpRecipientStatus status, int smtpCode, String smtpResponse, String errorMessage) {
+            this.status = status;
+            this.smtpCode = smtpCode;
+            this.smtpResponse = smtpResponse;
+            this.errorMessage = errorMessage;
+        }
 
-        try (SMTPTransport transport = (SMTPTransport) session.getTransport("smtp")) {
-            transport.connect();
+        public SmtpRecipientStatus getStatus() {
+            return status;
+        }
 
-            // Issue EHLO
-            transport.issueCommand("EHLO " + mxHost, 250);
+        public int getSmtpCode() {
+            return smtpCode;
+        }
 
-            // Issue MAIL FROM
-            transport.issueCommand("MAIL FROM:<validator@" + mxHost + ">", 250);
+        public String getSmtpResponse() {
+            return smtpResponse;
+        }
 
-            // Issue RCPT TO
-            try {
-                transport.issueCommand("RCPT TO:<" + email + ">", 250);
-                return SmtpRecipientStatus.Valid;
-            } catch (jakarta.mail.MessagingException e) {
-                String response = transport.getLastServerResponse();
-                if (response == null) return SmtpRecipientStatus.UnknownFailure;
+        public String getErrorMessage() {
+            return errorMessage;
+        }
+    }
 
-                response = response.toLowerCase();
-                if (response.startsWith("550") || response.contains("user not found") || response.contains("recipient address rejected"))
-                    return SmtpRecipientStatus.UserNotFound;
-                if (response.startsWith("450") || response.startsWith("451") || response.startsWith("452") || response.startsWith("4"))
-                    return SmtpRecipientStatus.TemporaryFailure;
+    public ValidationResult validateRecipient(String mxHost, String email) {
+        try (Socket socket = new Socket(mxHost, 25)) {
+            socket.setSoTimeout(5000);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
 
-                return SmtpRecipientStatus.UnknownFailure;
+            readResponse(reader); // Initial banner
+            writer.println("EHLO example.com");
+            readResponse(reader);
+
+            writer.println("MAIL FROM:<check@example.com>");
+            readResponse(reader);
+
+            writer.println("RCPT TO:<" + email + ">");
+            String response = reader.readLine();
+            int code = parseSmtpCode(response);
+
+            if (code == 250) {
+                return new ValidationResult(SmtpRecipientStatus.Valid, code, response, null);
+            } else if (code == 550) {
+                return new ValidationResult(SmtpRecipientStatus.UserNotFound, code, response, null);
+            } else if (code >= 400 && code < 500) {
+                return new ValidationResult(SmtpRecipientStatus.TemporaryFailure, code, response, null);
+            } else {
+                return new ValidationResult(SmtpRecipientStatus.UnknownFailure, code, response, null);
             }
 
+        } catch (SocketTimeoutException e) {
+            return new ValidationResult(SmtpRecipientStatus.TemporaryFailure, -1, null, "Timeout: " + e.getMessage());
         } catch (Exception e) {
-            return SmtpRecipientStatus.TemporaryFailure;
+            return new ValidationResult(SmtpRecipientStatus.UnknownFailure, -1, null, "Error: " + e.getMessage());
+        }
+    }
+
+    private void readResponse(BufferedReader reader) throws Exception {
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (line.length() < 4 || line.charAt(3) != '-') break;
+        }
+    }
+
+    private int parseSmtpCode(String response) {
+        if (response == null || response.length() < 3) return -1;
+        try {
+            return Integer.parseInt(response.substring(0, 3));
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 }
