@@ -3,6 +3,8 @@ package com.k3n.verifyemail.util;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -10,6 +12,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 
 @Component
 public class SmtpRcptValidator {
@@ -21,7 +24,8 @@ public class SmtpRcptValidator {
         Valid,
         UserNotFound,
         TemporaryFailure,
-        UnknownFailure
+        UnknownFailure,
+        Blacklisted
     }
 
     public static class ValidationResult {
@@ -67,7 +71,33 @@ public class SmtpRcptValidator {
             PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
 
             transcript.append(readAndLog(reader)).append("\n");
-            transcript.append(sendAndLog("EHLO example.com", reader, writer)).append("\n");
+            String ehloResponse = sendAndLog("EHLO gmail.com", reader, writer);
+            transcript.append(ehloResponse).append("\n");
+
+            if (ehloResponse.toLowerCase().contains("starttls")) {
+                transcript.append(sendAndLog("STARTTLS", reader, writer)).append("\n");
+
+                try {
+                    Socket tlsSocket = upgradeToTls(socket, mxHost);
+                    reader = new BufferedReader(new InputStreamReader(tlsSocket.getInputStream()));
+                    writer = new PrintWriter(tlsSocket.getOutputStream(), true);
+
+                    SSLSocket sslSocket = (SSLSocket) tlsSocket;
+                    transcript.append("<< TLS handshake successful\n");
+                    transcript.append("<< TLS protocol: ").append(sslSocket.getSession().getProtocol()).append("\n");
+                    transcript.append("<< TLS cipher suite: ").append(sslSocket.getSession().getCipherSuite()).append("\n");
+                    transcript.append(sendAndLog("EHLO gmail.com", reader, writer)).append("\n");
+
+                } catch (Exception tlsEx) {
+                    transcript.append("<< TLS handshake failed: ").append(tlsEx.getMessage()).append("\n");
+                    return new ValidationResult(SmtpRecipientStatus.TemporaryFailure, -1, null,
+                            "TLS handshake failed", mxHost, transcript.toString().trim(),
+                            timestamp, "TLSHandshakeFailed");
+                }
+            } else {
+                transcript.append(">> STARTTLS not supported by server\n");
+            }
+
             transcript.append(sendAndLog("MAIL FROM:<knnnbca@gmail.com>", reader, writer)).append("\n");
             String rcptResponse = sendAndLog("RCPT TO:<" + email + ">", reader, writer);
             transcript.append(rcptResponse).append("\n");
@@ -88,6 +118,30 @@ public class SmtpRcptValidator {
                     "Error: " + e.getMessage(), mxHost, transcript.toString().trim(),
                     timestamp, "Exception");
         }
+    }
+
+    public boolean isCatchAll(List<String> mxHosts, String domain) {
+        String testEmail = "nonexistent-" + System.currentTimeMillis() + "@" + domain;
+
+        for (String mxHost : mxHosts) {
+            ValidationResult result = validateRecipient(mxHost, testEmail);
+            if (result.getStatus() == SmtpRecipientStatus.Valid &&
+                    result.getSmtpCode() == 250 &&
+                    "Accepted".equals(result.getDiagnosticTag())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Socket upgradeToTls(Socket plainSocket, String mxHost) throws Exception {
+        SSLSocketFactory sslSocketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(
+                plainSocket, mxHost, plainSocket.getPort(), true);
+        sslSocket.setEnabledProtocols(new String[] {"TLSv1.2", "TLSv1.3"});
+        sslSocket.startHandshake();
+        return sslSocket;
     }
 
     private String sendAndLog(String command, BufferedReader reader, PrintWriter writer) throws Exception {
@@ -115,40 +169,28 @@ public class SmtpRcptValidator {
         if (response == null || response.length() < 3) return -1;
         String[] lines = response.split("\n");
         String lastLine = lines[lines.length - 1].trim();
-
-        // Remove transcript prefix if present
-        if (lastLine.startsWith("<< ")) {
-            lastLine = lastLine.substring(3).trim();
-        }
-
-        System.out.println("Parsing SMTP code from: " + lastLine);
-
-        if (lastLine.length() < 3) return -1;
-
+        if (lastLine.startsWith("<< ")) lastLine = lastLine.substring(3).trim();
         try {
             return Integer.parseInt(lastLine.substring(0, 3));
         } catch (NumberFormatException e) {
-            System.out.println("Failed to parse SMTP code: " + e.getMessage());
             return -1;
         }
     }
 
-
     private SmtpRecipientStatus classifyResponse(int code, String response) {
         String lower = response != null ? response.toLowerCase() : "";
-
         if (code >= 250 && code <= 259) return SmtpRecipientStatus.Valid;
         if (code == 252 || (code >= 400 && code < 500)) return SmtpRecipientStatus.TemporaryFailure;
         if (code == 550 || code == 551 || code == 553 || lower.contains("user not found")) return SmtpRecipientStatus.UserNotFound;
         if (code == 554 || lower.contains("relay access denied") || lower.contains("not permitted")) return SmtpRecipientStatus.UnknownFailure;
         if (code >= 500 && code < 600) return SmtpRecipientStatus.UnknownFailure;
+        if (code == 550 && (lower.contains("blocked") || lower.contains("spamhaus") || lower.contains("blacklist"))) return SmtpRecipientStatus.Blacklisted;
 
         return SmtpRecipientStatus.UnknownFailure;
     }
 
     private String generateDiagnosticTag(int code, String response) {
         String lower = response != null ? response.toLowerCase() : "";
-
         if (code == 250) return "Accepted";
         if (code == 251) return "Forwarded";
         if (code == 252) return "CannotVerify";
@@ -156,16 +198,12 @@ public class SmtpRcptValidator {
         if (code == 450) return "MailboxBusy";
         if (code == 451) return "LocalError";
         if (code == 452) return "InsufficientStorage";
-        if (code == 550) return "MailboxNotFound";
+        if (code == 550) return "UserNotFound";
         if (code == 551) return "UserNotLocal";
         if (code == 552) return "StorageExceeded";
-        if (code == 553) return "MailboxNameInvalid";
-        if (code == 554) return "TransactionFailed";
         if (lower.contains("relay access denied")) return "RelayDenied";
         if (lower.contains("not permitted")) return "AccessDenied";
-        if (lower.contains("greylist")) return "Greylisted";
-        if (lower.contains("syntax")) return "SyntaxError";
-
+        if (lower.contains("spamhaus") || lower.contains("blocked using") || lower.contains("blacklist")) return "BlockedByBlacklist";
         return "Unclassified";
     }
 }

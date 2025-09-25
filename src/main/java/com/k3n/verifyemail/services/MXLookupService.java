@@ -3,6 +3,7 @@ package com.k3n.verifyemail.services;
 import com.k3n.verifyemail.config.BlacklistDomainConfig;
 import com.k3n.verifyemail.config.DisposableDomainConfig;
 import com.k3n.verifyemail.config.WhitelistedDomains;
+import com.k3n.verifyemail.dto.EmailValidationResult;
 import com.k3n.verifyemail.util.SmtpRcptValidator;
 import com.k3n.verifyemail.util.SmtpRcptValidator.SmtpRecipientStatus;
 import com.k3n.verifyemail.util.SmtpRcptValidator.ValidationResult;
@@ -40,68 +41,92 @@ public class MXLookupService {
         this.smtpRcptValidator = smtpRcptValidator;
     }
 
-    public String categorizeEmail(String email) {
-        if (!isValidEmail(email)) return "Invalid";
+    public EmailValidationResult categorizeEmail(String email) {
+        EmailValidationResult result = new EmailValidationResult();
+        result.setEmail(email);
+
+        if (!isValidEmail(email)) {
+            result.setCategory("Invalid");
+            return result;
+        }
 
         String domain = extractDomain(email);
-        if (domain == null) return "Invalid";
+        if (domain == null) {
+            result.setCategory("Invalid");
+            return result;
+        }
 
-        if (isDisposableDomain(domain)) return "Disposable";
+        if (isDisposableDomain(domain)) {
+            result.setCategory("Disposable");
+            return result;
+        }
 
         List<String> mxRecords;
         try {
             mxRecords = getMXRecords(domain);
         } catch (NamingException e) {
-            return "Unknown";
+            result.setCategory("Unknown");
+            return result;
         }
 
-        if (mxRecords.isEmpty()) return "Invalid";
+        if (mxRecords.isEmpty()) {
+            result.setCategory("Invalid");
+            return result;
+        }
 
         try {
-            if (isCatchAll(mxRecords, domain)) return "Catch-All";
+            if (isCatchAll(mxRecords, domain)) {
+                result.setCategory("Catch-All");
+                return result;
+            }
         } catch (IOException e) {
-            return "Unknown";
+            result.setCategory("Unknown");
+            return result;
         }
 
-        ValidationResult result = smtpCheckStatus(mxRecords, email);
-        if (result == null) return "Unknown";
+        ValidationResult smtp = smtpCheckStatus(mxRecords, email);
+        if (smtp == null) {
+            result.setCategory("Unknown");
+            return result;
+        }
 
-        // Optional: log diagnostics
-        System.out.println("SMTP Status: " + result.getStatus());
-        System.out.println("SMTP Code: " + result.getSmtpCode());
-        System.out.println("Diagnostic Tag: " + result.getDiagnosticTag());
-        System.out.println("Transcript:\n" + result.getFullTranscript());
+        result.setDiagnosticTag(smtp.getDiagnosticTag());
+        result.setSmtpCode(smtp.getSmtpCode());
+        result.setStatus(smtp.getStatus().name());
+        result.setTranscript(smtp.getFullTranscript());
+        result.setMailHost(smtp.getMxHost());
+        result.setTimestamp(smtp.getTimestamp());
+        /*
+        result.setIsCatchAll(smtp.isCatchAll());
+        result.setPortOpened(smtp.isPortOpened());
+        result.setConnectionSuccessful(smtp.isConnectionSuccessful());
+        result.setErrors(smtp.getErrorMessage());
+        */
 
-        switch (result.getDiagnosticTag()) {
-            case "Accepted":
-                return "Valid";
-            case "Forwarded":
-                return "Forwarded";
-            case "CannotVerify":
-                return "CannotVerify";
-            case "MailboxBusy":
-                return "MailboxBusy";
-            case "LocalError":
-                return "LocalError";
-            case "InsufficientStorage":
-                return "InsufficientStorage";
+
+        // Categorize based on diagnostic tag
+        String tag = Optional.ofNullable(smtp.getDiagnosticTag()).orElse("").trim();
+        switch (tag) {
+            case "Accepted": result.setCategory("Valid"); break;
+            case "Forwarded": result.setCategory("Forwarded"); break;
+            case "CannotVerify": result.setCategory("CannotVerify"); break;
+            case "MailboxBusy": result.setCategory("MailboxBusy"); break;
+            case "LocalError": result.setCategory("LocalError"); break;
+            case "InsufficientStorage": result.setCategory("InsufficientStorage"); break;
             case "MailboxNotFound":
             case "UserNotLocal":
-            case "MailboxNameInvalid":
-                return "UserNotFound";
-            case "RelayDenied":
-                return "RelayDenied";
-            case "AccessDenied":
-                return "AccessDenied";
-            case "Greylisted":
-                return "Greylisted";
-            case "SyntaxError":
-                return "SyntaxError";
-            case "TransactionFailed":
-                return "Invalid";
+            case "MailboxNameInvalid": result.setCategory("UserNotFound"); break;
+            case "RelayDenied": result.setCategory("RelayDenied"); break;
+            case "AccessDenied": result.setCategory("AccessDenied"); break;
+            case "Greylisted": result.setCategory("Greylisted"); break;
+            case "SyntaxError": result.setCategory("SyntaxError"); break;
+            case "TransactionFailed": result.setCategory("Invalid"); break;
+            case "BlockedByBlacklist": result.setCategory("Blocklisted"); break;
             default:
-                return result.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid";
+                result.setCategory(smtp.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid");
         }
+
+        return result;
     }
 
     public boolean isValidEmail(String email) {
